@@ -1,0 +1,10 @@
+node_modules/
+npm-debug.log*
+
+# never commit a password file used with --password-file
+pw.txt
+*.password
+
+# test output
+*.locked
+!test/fixtures/**
