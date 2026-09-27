@@ -18,9 +18,16 @@ import readline from 'node:readline';
 const MIN_PASSWORD_LENGTH = 8;
 
 export class PasswordError extends Error {
-  constructor(message) {
+  /**
+   * @param {string} message what went wrong, lower case, no trailing period
+   * @param {string|null} [hint] the way out, shown on its own line under the
+   *   message. `formatError` reads this field by name, so a hint passed any
+   *   other way is silently dropped and the user is left with a puzzle.
+   */
+  constructor(message, hint = null) {
     super(message);
     this.name = 'PasswordError';
+    this.hint = hint;
   }
 }
 
@@ -74,11 +81,58 @@ function promptOnce(label) {
     const input = tty ?? process.stdin;
     const output = tty ?? process.stderr;
 
+    // Reading a password needs one of these three states to end the wait, and
+    // the failure they all guard against is the same: a promise that never
+    // settles. Node reports that as "Detected unsettled top-level await" and
+    // exits 13 -- an errno, not one of this tool's exit codes -- so
+    // `lockbox encrypt f < /dev/null` looked like a crash instead of "no
+    // password was given".
+    //
+    // Which one fires depends on when the input ends, which is why all three
+    // are needed and none is redundant:
+    //
+    //   'line'  the normal case; the only one that carries a password.
+    //   'close' the input ended while this prompt was waiting. Readline emits
+    //           `close` with no `line` and no `error`.
+    //   'end'   the input ended *before* this prompt started. That is not
+    //           hypothetical: `encrypt` asks twice (password, then confirm), so
+    //           a here-string with one line leaves the second prompt reading a
+    //           stream that is already done. Readline then emits nothing at all
+    //           -- the probe that found this showed the second prompt timing out
+    //           with every listener still silent -- so a pre-check plus a
+    //           listener on the stream itself is the only way to catch it.
+    const noPassword = () =>
+      new PasswordError(
+        'no password was given (the input ended before one was entered)',
+        'pass --password-file, --password-env, or run this in a terminal',
+      );
+
+    let settled = false;
+    let rl = null;
+    let onEnd = null;
+
+    function settle(fn, value) {
+      if (settled) return;
+      settled = true;
+      if (onEnd) input.off('end', onEnd);
+      if (rl) rl.close();
+      if (tty) tty.close();
+      fn(value);
+    }
+
+    // The stream can already be finished here. Rejecting without creating a
+    // readline interface is what turns a hang into a message.
+    if (input.readableEnded || input.destroyed) {
+      output.write('\n');
+      settle(reject, noPassword());
+      return;
+    }
+
     if (!tty) {
       output.write('warning: no terminal available, the password will be visible as you type\n');
     }
 
-    const rl = readline.createInterface({ input, output, terminal: true });
+    rl = readline.createInterface({ input, output, terminal: true });
     let muted = false;
     if (tty && typeof input.setRawMode === 'function') {
       const originalWrite = rl._writeToOutput?.bind(rl);
@@ -91,22 +145,25 @@ function promptOnce(label) {
     output.write(label);
     muted = true;
 
+    onEnd = () => {
+      output.write('\n');
+      settle(reject, noPassword());
+    };
+    input.once('end', onEnd);
+
     rl.once('line', (line) => {
-      rl.close();
-      if (tty) tty.close();
       output.write('\n');
-      resolve(line);
+      settle(resolve, line);
     });
-    rl.once('error', (error) => {
-      rl.close();
-      if (tty) tty.close();
-      reject(error);
-    });
+    rl.once('error', (error) => settle(reject, error));
     rl.once('SIGINT', () => {
-      rl.close();
-      if (tty) tty.close();
       output.write('\n');
-      reject(new PasswordError('cancelled'));
+      settle(reject, new PasswordError('cancelled'));
+    });
+    rl.once('close', () => {
+      if (settled) return;
+      output.write('\n');
+      settle(reject, noPassword());
     });
   });
 }

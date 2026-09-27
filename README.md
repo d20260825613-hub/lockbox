@@ -99,6 +99,20 @@ notes.txt.locked
   container       126 bytes  (matches the header)
 ```
 
+## Exit codes
+
+| Code | Meaning |
+| --- | --- |
+| 0 | the command did what it was asked |
+| 1 | the operation failed: a wrong password, a damaged container, an unreadable file |
+| 2 | the request was impossible: a bad option, a missing file, refusing to overwrite without `--force`, output and input being the same file |
+
+The split matters in a script. `2` means nothing was attempted and passing
+`--force` (or fixing the command) may be all that is needed; `1` means the tool
+tried and the data, the password or the disk said no, so retrying the same way
+will not help. A failed decryption is always `1` and always leaves no output
+behind.
+
 ## How it works
 
 Two layers, and both are worth understanding before you rely on this.
