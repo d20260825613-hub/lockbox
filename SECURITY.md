@@ -48,7 +48,9 @@ pointer back to this file.
 - **There is no password recovery, by design.** No escrow, no hint, no reset. If
   the password is lost the data is gone. This is worth repeating.
 - **It does not shred anything.** Deleting a file does not erase it from a disk,
-  and lockbox never deletes anyway.
+  and lockbox removes only a file it created itself: a half-written output is
+  deleted, and a file that was already at the output path is never touched. Use
+  a tool built for the job if you need data erased.
 - **The format has not been audited** by anyone outside this project. The
   primitives come from Node, but their arrangement here is mine.
 

@@ -208,6 +208,27 @@ test('handlers can be installed again after being removed', () => {
   assert.equal(process.listenerCount('SIGINT'), baseline);
 });
 
+test('an interrupt hook that takes over is not cut short by an exit', () => {
+  // A tool with a file to clean up returns true from `onInterrupt` and finishes
+  // the stop itself. Exiting here instead would kill the process in the middle
+  // of that cleanup -- which is exactly how Ctrl-C used to leave a half-written
+  // output file behind while reporting that it had left none.
+  const seen = [];
+  const remove = installCliHandlers({
+    tool: 'test',
+    onInterrupt: (signal) => {
+      seen.push(signal);
+      return true;
+    },
+  });
+  try {
+    process.emit('SIGINT', 'SIGINT');
+    assert.deepEqual(seen, ['SIGINT'], 'the hook did not run, or the process exited instead of handing over');
+  } finally {
+    remove();
+  }
+});
+
 test('the bin entry installs the handlers, which the module alone cannot do', async () => {
   // The bug this pins down: importing `run` makes src/cli.js's direct-run check
   // false, so handlers installed only there never fire for the installed

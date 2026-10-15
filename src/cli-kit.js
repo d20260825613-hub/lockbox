@@ -172,8 +172,10 @@ const installed = new WeakMap();
  *             written to a pipe nobody is reading, and it also breaks `$?`
  *             checks in a script that pipes into `head`.
  *   SIGINT    Ctrl-C — stop, do not print a stack trace for the interruption.
- *             A tool with cleanup can pass `onInterrupt`; a second Ctrl-C exits
- *             immediately so nobody is ever trapped waiting.
+ *             A tool with cleanup can pass `onInterrupt`; returning `true` from
+ *             it hands the stop over to that cleanup, which then sets the exit
+ *             status itself. A second Ctrl-C exits immediately so nobody is ever
+ *             trapped waiting.
  *   leftovers an uncaught exception or an unhandled rejection used to escape as
  *             a stack trace; they now go through `formatError` like everything
  *             else, unless debug is on.
@@ -182,7 +184,8 @@ const installed = new WeakMap();
  *
  * @param {object} options
  * @param {string} options.tool name used as the prefix of every message
- * @param {(signal: string) => void} [options.onInterrupt] cleanup hook
+ * @param {(signal: string) => (boolean|void)} [options.onInterrupt] cleanup hook;
+ *   return `true` to finish the stop yourself instead of exiting here
  * @param {() => string} [options.usage] help text, shown for a usage error
  * @param {() => boolean} [options.debug] read at throw time, not at install time
  * @returns {() => void} removes every handler again (for tests)
@@ -213,12 +216,16 @@ export function installCliHandlers({ tool, onInterrupt = null, usage = null, deb
       process.exit(signal === 'SIGINT' ? 130 : 143);
     }
     interrupted = true;
+    let handled = false;
     try {
-      onInterrupt?.(signal);
+      handled = onInterrupt?.(signal) === true;
     } catch {
       /* cleanup must never mask the exit */
     }
-    process.exit(signal === 'SIGINT' ? 130 : 143);
+    // A hook that returns true is finishing the stop itself -- it has a write to
+    // clean up, and exiting here would cut that short and leave the half-written
+    // file behind. From then on the exit status is the hook's to set.
+    if (!handled) process.exit(signal === 'SIGINT' ? 130 : 143);
   };
   process.on('SIGINT', onSignal);
   process.on('SIGTERM', onSignal);

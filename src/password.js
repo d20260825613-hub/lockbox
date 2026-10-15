@@ -48,7 +48,12 @@ export async function readPassword(options = {}, { confirm = false } = {}) {
   }
   if (options.passwordFile) {
     const text = await fs.promises.readFile(options.passwordFile, 'utf8');
-    const first = text.split(/\r?\n/)[0];
+    // A BOM is an artifact of the editor rather than part of the password:
+    // Notepad and many other Windows editors write one by default, and a
+    // password nobody can type is a password that is lost with the file. A lone
+    // `\r` ends a line too (the old Mac convention), so it separates lines
+    // instead of joining the whole file into one password.
+    const first = text.replace(/^\uFEFF/, '').split(/\r\n|\r|\n/)[0];
     if (!first) throw new PasswordError(`${options.passwordFile} is empty`);
     return first;
   }

@@ -41,6 +41,40 @@ export const DEFAULT_P = 1;
 export const MIN_LOG2_N = 12;
 export const MAX_LOG2_N = 22;
 
+/**
+ * The largest scrypt parameters a container may carry.
+ *
+ * r and p are one byte each, so a header can name anything up to 255 -- and the
+ * key is derived before a single tag is checked, which turns those two bytes
+ * into a lever on this machine's memory. Unbounded, a 40-byte file was enough to
+ * make `decrypt` allocate hundreds of gigabytes and stall for minutes before
+ * reporting the same "wrong password" it would have reported at once.
+ *
+ * The memory ceiling is what the most expensive container this build writes
+ * needs: log2(N)=22 with r=8, at 128 * N * r bytes. A header may not ask for
+ * more than that, and the parameters themselves stay far below one byte's worth.
+ */
+export const MAX_R = 32;
+export const MAX_P = 16;
+export const MAX_KDF_MEMORY = 128 * 2 ** MAX_LOG2_N * DEFAULT_R;
+
+/**
+ * The most chunks one container may hold.
+ *
+ * A chunk nonce is the salt with a 32-bit index XORed into its tail, so index i
+ * and index i + 2^32 would share a nonce -- and a repeated GCM nonce leaks the
+ * keystream and eventually the authentication key. Refusing a header that needs
+ * more than 2^32 - 1 chunks is what keeps the nonce space large enough for every
+ * container this build will open; the parameter is not written down anywhere
+ * else, so the limit lives beside the calculation.
+ */
+export const MAX_CHUNK_COUNT = 2 ** 32 - 1;
+
+/** Memory one scrypt call asks for: 128 * N * r bytes, independent of p. */
+export function kdfMemoryBytes(log2N, r) {
+  return 128 * 2 ** log2N * r;
+}
+
 /** Chunk size lives in one header byte as its base-2 logarithm. */
 export const MIN_CHUNK_LOG2 = 8; // 256 B
 export const MAX_CHUNK_LOG2 = 32; // 4 GiB
@@ -83,12 +117,32 @@ export function buildHeader({
   if (!Number.isInteger(log2N) || log2N < MIN_LOG2_N || log2N > MAX_LOG2_N) {
     throw new FormatError(`log2(N) must be between ${MIN_LOG2_N} and ${MAX_LOG2_N}`);
   }
+  // The read side refuses these, so the write side has to as well: writing a
+  // container this build will then reject produces a file that can never be
+  // opened, and the whole point of validating here is that it never exists.
+  // Checking r and p by hand also keeps the range error from `writeUInt8` -- a
+  // bare `RangeError` for r=256 -- from escaping to the caller.
+  if (!Number.isInteger(r) || r < 1 || r > MAX_R) {
+    throw new FormatError(`r must be an integer between 1 and ${MAX_R}`);
+  }
+  if (!Number.isInteger(p) || p < 1 || p > MAX_P) {
+    throw new FormatError(`p must be an integer between 1 and ${MAX_P}`);
+  }
+  if (kdfMemoryBytes(log2N, r) > MAX_KDF_MEMORY) {
+    throw new FormatError(`log2(N)=${log2N} with r=${r} would need more memory than this build allows`);
+  }
   if (!Number.isSafeInteger(chunkSize) || chunkSize <= 0) {
     throw new FormatError('chunkSize must be a positive integer');
   }
   const chunkLog2 = Math.round(Math.log2(chunkSize));
   if (2 ** chunkLog2 !== chunkSize || chunkLog2 < MIN_CHUNK_LOG2 || chunkLog2 > MAX_CHUNK_LOG2) {
     throw new FormatError(`chunkSize must be a power of two between 2^${MIN_CHUNK_LOG2} and 2^${MAX_CHUNK_LOG2}`);
+  }
+  const chunkCount = Math.max(1, Math.ceil(plaintextLength / chunkSize));
+  if (chunkCount > MAX_CHUNK_COUNT) {
+    throw new FormatError(
+      `a plaintext of ${plaintextLength} bytes in ${chunkSize}-byte chunks needs ${chunkCount} chunks, more than the ${MAX_CHUNK_COUNT} the format carries`,
+    );
   }
 
   const header = Buffer.alloc(HEADER_SIZE);
@@ -135,6 +189,16 @@ export function parseHeader(buffer) {
     throw new FormatError(`log2(N)=${log2N} is outside the supported range ${MIN_LOG2_N}..${MAX_LOG2_N}`);
   }
   if (r < 1 || p < 1) throw new FormatError('invalid scrypt parameters');
+  if (r > MAX_R || p > MAX_P) {
+    throw new FormatError(
+      `scrypt r=${r} and p=${p} are outside the range this build supports (at most r=${MAX_R}, p=${MAX_P})`,
+    );
+  }
+  if (kdfMemoryBytes(log2N, r) > MAX_KDF_MEMORY) {
+    throw new FormatError(
+      `scrypt log2(N)=${log2N} with r=${r} asks for more memory than this build allows`,
+    );
+  }
   if (chunkLog2 < MIN_CHUNK_LOG2 || chunkLog2 > MAX_CHUNK_LOG2) {
     throw new FormatError(`chunk size 2^${chunkLog2} is outside the supported range`);
   }
@@ -144,6 +208,14 @@ export function parseHeader(buffer) {
   if (!Number.isSafeInteger(plaintextLength) || plaintextLength < 0) {
     // Guards against a header claiming a size this runtime cannot address.
     throw new FormatError('the header declares an implausible plaintext length');
+  }
+
+  const chunkCount = Math.max(1, Math.ceil(plaintextLength / chunkSize));
+  if (chunkCount > MAX_CHUNK_COUNT) {
+    // Two chunks this far apart would share a nonce; see MAX_CHUNK_COUNT.
+    throw new FormatError(
+      `the header describes ${chunkCount} chunks, more than the ${MAX_CHUNK_COUNT} the format carries`,
+    );
   }
 
   return {
@@ -156,7 +228,7 @@ export function parseHeader(buffer) {
     chunkSize,
     salt: Buffer.from(buffer.subarray(16, 32)),
     plaintextLength,
-    chunkCount: Math.max(1, Math.ceil(plaintextLength / chunkSize)),
+    chunkCount,
   };
 }
 
@@ -177,12 +249,23 @@ export function chunkAad(header, index, isFinal) {
   return aad;
 }
 
-/** Nonce for chunk `index`: the salt with the chunk index XORed into its tail. */
+/**
+ * Nonce for chunk `index`: the salt with the chunk index XORed into its tail.
+ *
+ * The tail is 32 bits wide, which is exactly what the index may be, so an index
+ * that does not fit is refused instead of being truncated into another chunk's
+ * nonce: `chunkNonce(base, 0)` and `chunkNonce(base, 2**32)` used to be the same
+ * twelve bytes, and two chunks encrypted under one nonce share a GCM keystream
+ * and eventually the authentication key. Headers with that many chunks are
+ * rejected by `parseHeader`, so no container can reach this.
+ */
 export function chunkNonce(baseNonce, index) {
   if (!Buffer.isBuffer(baseNonce) || baseNonce.length !== 12) {
     throw new FormatError('the nonce base must be 12 bytes');
   }
-  if (!Number.isSafeInteger(index) || index < 0) throw new FormatError('chunk index must be >= 0');
+  if (!Number.isSafeInteger(index) || index < 0 || index > MAX_CHUNK_COUNT) {
+    throw new FormatError(`chunk index must be between 0 and ${MAX_CHUNK_COUNT}`);
+  }
   const nonce = Buffer.from(baseNonce);
   // `^` yields a signed 32-bit value; >>> 0 puts it back in unsigned range or
   // writeUInt32BE rejects a legitimately high index.

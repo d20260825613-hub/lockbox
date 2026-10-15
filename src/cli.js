@@ -25,7 +25,7 @@ import { DEFAULT_LOG2_N, MAX_LOG2_N, MIN_LOG2_N, FormatError } from './format.js
 import { readPassword } from './password.js';
 import { formatBytes, formatBytesLong } from './util.js';
 
-const VERSION = '0.1.0';
+const VERSION = '0.2.0';
 const SUFFIX = '.locked';
 
 const USAGE = `lockbox - encrypt a file with a password
@@ -166,6 +166,15 @@ function parseArgs(argv) {
       }),
     };
   }
+  // An empty `--out=` is a value the user gave, not the absence of one, and
+  // treating the two alike silently wrote to the default name instead.
+  if (values.out === '') {
+    return {
+      error: new UsageError('--out needs a non-empty file name', {
+        hint: 'for example --out notes.txt.locked',
+      }),
+    };
+  }
   return { values, positional };
 }
 
@@ -189,26 +198,117 @@ export class OutputError extends Error {
 /** Default output name, and the guard against clobbering something. */
 async function resolveOutput({ input, out, force, decrypting }) {
   let target = out;
-  if (!target) {
+  if (target === null) {
     target = decrypting
       ? input.endsWith(SUFFIX)
         ? input.slice(0, -SUFFIX.length)
         : `${input}.unlocked`
       : `${input}${SUFFIX}`;
   }
-  const absolute = path.resolve(target);
-  if (absolute === path.resolve(input)) {
+  if (await sameFile(target, input)) {
     throw new OutputError('input and output are the same file');
   }
   if (!force) {
     try {
-      await fs.access(absolute);
+      await fs.access(target);
       throw new OutputError(`${target} already exists; pass --force to overwrite it`);
     } catch (error) {
       if (error.code !== 'ENOENT') throw error;
     }
   }
   return target;
+}
+
+/**
+ * Would writing to `output` destroy `input`?
+ *
+ * Comparing the two as strings is not enough, and every way it falls short is a
+ * way to lose a file. `NOTES.TXT` and `notes.txt` are one file on Windows, and
+ * `path.resolve` keeps whichever spelling it was handed -- `fs.realpath` on
+ * Windows does too, so it cannot be leaned on for this. Short 8.3 names,
+ * junctions and hard links likewise give two strings for one file.
+ *
+ * So the filesystem is asked instead. When both names exist, device and inode
+ * settle it: `notes.txt` and `NOTES.TXT` report the same pair, as do two hard
+ * links to one file. When the output does not exist the only way it can still be
+ * the input is a difference in spelling, so the two paths are resolved and
+ * compared case-insensitively where the platform compares them that way.
+ */
+async function sameFile(output, input) {
+  try {
+    const [left, right] = await Promise.all([fs.stat(output, { bigint: true }), fs.stat(input, { bigint: true })]);
+    // Some filesystems report no inode at all; falling through to the names
+    // beats declaring every pair of files identical.
+    if (left.ino !== 0n || right.ino !== 0n) return left.dev === right.dev && left.ino === right.ino;
+  } catch {
+    // The output does not exist, which is the ordinary case for a new name.
+  }
+  const [left, right] = await Promise.all([canonicalPath(output), canonicalPath(input)]);
+  if (left === right) return true;
+  return (process.platform === 'win32' || process.platform === 'darwin') && left.toLowerCase() === right.toLowerCase();
+}
+
+/**
+ * The most complete name this file has without it existing.
+ *
+ * `realpath` folds away `..`, symlinks and, on macOS, the name's real case. When
+ * the file itself is not there yet, resolving its directory still removes the
+ * `..` and the symlinked parent -- which is what lets `notes.txt` and
+ * `sub/../notes.txt` compare equal.
+ */
+async function canonicalPath(target) {
+  const resolved = path.resolve(target);
+  try {
+    return await fs.realpath(resolved);
+  } catch {
+    const directory = await fs.realpath(path.dirname(resolved)).catch(() => path.dirname(resolved));
+    return path.join(directory, path.basename(resolved));
+  }
+}
+
+/**
+ * The write a Ctrl-C should interrupt, if one is running.
+ *
+ * A signal handler that exits on the spot skips the cleanup the write already
+ * has, so the half-written file stayed on disk while the message said it had
+ * not. The handler below aborts the write instead and lets it unwind.
+ */
+let currentRun = null;
+
+/** The signal that asked the current run to stop, for the exit status. */
+let stopSignal = null;
+
+/** 130 is Ctrl-C and 143 is SIGTERM, which is what a shell expects. */
+function stopStatus() {
+  return stopSignal === 'SIGTERM' ? 143 : 130;
+}
+
+/** Start the writing half of a command, so a signal has something to abort. */
+function beginWrite() {
+  const controller = new AbortController();
+  currentRun = controller;
+  stopSignal = null;
+  return controller;
+}
+
+function endWrite(controller) {
+  if (currentRun === controller) currentRun = null;
+}
+
+/**
+ * Say which file is not there.
+ *
+ * An ENOENT from opening the *output* used to be reported as a missing input,
+ * which sends the user to check a file that is perfectly fine; the real problem
+ * is that the output's directory does not exist. The paths are compared rather
+ * than the error's text, because only the path says which one failed.
+ */
+function missingFileMessage(error, input, output) {
+  const failed = typeof error.path === 'string' ? path.resolve(error.path) : null;
+  if (failed && failed === path.resolve(output)) {
+    return `cannot write ${output}: its directory does not exist`;
+  }
+  return `no such file: ${input}`;
 }
 
 function progressReporter(enabled, label) {
@@ -251,6 +351,7 @@ async function commandEncrypt(argv) {
     return fail(error ?? String(error));
   }
 
+  const controller = beginWrite();
   try {
     await encryptFile({
       input,
@@ -258,13 +359,21 @@ async function commandEncrypt(argv) {
       password,
       log2N: values.cost,
       force: values.force,
+      signal: controller.signal,
       onProgress: progressReporter(values.progress, 'encrypting'),
     });
   } catch (error) {
-    // Never leave a half-written container behind, whatever went wrong.
-    await fs.rm(output, { force: true });
-    if (error.code === 'ENOENT') return fail(`no such file: ${input}`, 2);
+    if (values.progress && process.stderr.isTTY) process.stderr.write('\r\u001b[K');
+    // Removing the output is the write's own job now: it knows whether this run
+    // created the file, and deleting the output *path* on any error is how a
+    // failure to even read the input used to destroy a file that was already
+    // there. See `openOutput`.
+    if (controller.signal.aborted) return fail(stoppedMessage(), stopStatus());
+    if (error instanceof FormatError) return fail(error.message, 2);
+    if (error.code === 'ENOENT') return fail(missingFileMessage(error, input, output), 2);
     return fail(error.message);
+  } finally {
+    endWrite(controller);
   }
 
   const info = await inspectFile(output);
@@ -302,12 +411,14 @@ async function commandDecrypt(argv) {
     // puzzle instead of the flag that fixes it.
     return fail(error ?? String(error));
   }
+  const controller = beginWrite();
   try {
     const result = await decryptFile({
       input,
       output,
       password,
       force: values.force,
+      signal: controller.signal,
       onProgress: progressReporter(values.progress, 'decrypting'),
     });
     if (values.progress && process.stderr.isTTY) process.stderr.write('\r\u001b[K');
@@ -315,12 +426,15 @@ async function commandDecrypt(argv) {
     return 0;
   } catch (error) {
     if (values.progress && process.stderr.isTTY) process.stderr.write('\r\u001b[K');
+    if (controller.signal.aborted) return fail(stoppedMessage(), stopStatus());
     if (error instanceof DecryptError) {
       return fail(`${error.message}\n  the partial output was deleted; nothing was written`);
     }
     if (error instanceof FormatError) return fail(error.message, 2);
-    if (error.code === 'ENOENT') return fail(`no such file: ${input}`, 2);
+    if (error.code === 'ENOENT') return fail(missingFileMessage(error, input, output), 2);
     return fail(error.message);
+  } finally {
+    endWrite(controller);
   }
 }
 
@@ -329,6 +443,7 @@ async function commandInspect(argv) {
   if (parsed.error) return failUsage(parsed.error);
   const input = parsed.positional[0];
   if (!input) return failUsageMessage('inspect needs a .locked file');
+  if (parsed.positional.length > 1) return failUsageMessage('inspect takes exactly one file');
 
   try {
     const info = await inspectFile(input);
@@ -344,6 +459,13 @@ async function commandInspect(argv) {
     );
     return info.truncated || info.extraData ? 2 : 0;
   } catch (error) {
+    // The same split the other two commands use, and the one the README and the
+    // changelog already promised: 2 for "this file cannot work" and 1 for "the
+    // operation failed". A missing file and a failed format check both fell
+    // through to 1 here, so a script branching on the documented codes got the
+    // opposite answer.
+    if (error.code === 'ENOENT') return fail(`no such file: ${input}`, 2);
+    if (error instanceof FormatError) return fail(error.message, 2);
     return fail(error.message);
   }
 }
@@ -385,6 +507,21 @@ async function dispatch(argv) {
   }
 
   const [command, ...rest] = argv;
+
+  // `-h`, `--help` and `-v`, `--version` work after a command too. They are
+  // listed under Options, so refusing them made the tool answer
+  // `encrypt --help` with "unknown option --help / did you mean --help?" and
+  // leave the user with nothing at all.
+  const known = command === 'encrypt' || command === 'decrypt' || command === 'inspect';
+  if (known && (rest.includes('-h') || rest.includes('--help'))) {
+    process.stdout.write(USAGE);
+    return 0;
+  }
+  if (known && (rest.includes('-v') || rest.includes('--version'))) {
+    process.stdout.write(`${VERSION}\n`);
+    return 0;
+  }
+
   switch (command) {
     case 'encrypt':
       return commandEncrypt(rest);
@@ -419,9 +556,22 @@ export function installHandlers() {
     usage: () => USAGE,
     debug: isDebug,
     onInterrupt: (signal) => {
-      if (signal === 'SIGINT') process.stderr.write('\nlockbox: stopped. No output file was finished, so none was left behind.\n');
+      // A Ctrl-C with a write in flight aborts that write rather than ending the
+      // process here. The write then unwinds through its own cleanup, which is
+      // what removes the half-written output -- and what makes the message below
+      // true. Exiting on the spot skipped that and left the partial file behind
+      // while saying it had not.
+      if (!currentRun) return false;
+      stopSignal = signal;
+      currentRun.abort();
+      return true; // the write finishes the stop and reports the exit status
     },
   });
+}
+
+/** What to say once a signal has stopped a run and its cleanup has finished. */
+function stoppedMessage() {
+  return 'stopped. No output file was finished, so none was left behind';
 }
 
 // Only run when invoked directly, so importing this module in a test is safe.

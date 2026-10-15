@@ -10,6 +10,7 @@
 
 import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
+import process from 'node:process';
 
 import {
   CHUNK_SIZE,
@@ -23,6 +24,7 @@ import {
   buildHeader,
   chunkAad,
   chunkNonce,
+  kdfMemoryBytes,
   parseHeader,
 } from './format.js';
 
@@ -35,6 +37,80 @@ export class DecryptError extends Error {
     super(message);
     this.name = 'DecryptError';
   }
+}
+
+/**
+ * Open the output for writing without being able to damage what is already there.
+ *
+ * Without `force` this is an exclusive create, which refuses to touch a file that
+ * exists. With `force` the bytes go to a temporary file beside the destination
+ * and are renamed over it only once they are complete, so a failure halfway
+ * through leaves whatever was there exactly as it was.
+ *
+ * Both halves are load-bearing. The exclusive create is what makes it safe for
+ * the caller to delete the output on failure -- the only file this run may
+ * remove is one it created -- and the temporary file is what keeps a
+ * `--force` overwrite from destroying the file it was allowed to replace until
+ * the replacement is known to be good.
+ *
+ * @param {string} output
+ * @param {boolean} force
+ * @returns {Promise<{handle: import('node:fs/promises').FileHandle, temporary: string|null}>}
+ */
+async function openOutput(output, force) {
+  try {
+    if (!force) return { handle: await fs.open(output, 'wx'), temporary: null };
+    // Beside the destination, so the rename stays a rename rather than a copy
+    // across devices. The random part keeps two runs in one directory apart.
+    const temporary = `${output}.lockbox-${process.pid}-${crypto.randomBytes(6).toString('hex')}.tmp`;
+    return { handle: await fs.open(temporary, 'wx'), temporary };
+  } catch (error) {
+    // Report the path the caller asked for rather than the temporary file
+    // beside it: the caller has to be able to tell a missing input from a
+    // missing output directory, and only one of those paths is the one it knows.
+    if (error.code === 'ENOENT') error.path = output;
+    throw error;
+  }
+}
+
+/**
+ * Put a finished writer in place, closing it first.
+ *
+ * Until this runs, the previous file at the destination is untouched; after it,
+ * the new file is complete and authenticated. Mutates `out` so the caller's
+ * cleanup knows there is no handle and no temporary file left to remove.
+ */
+async function publishOutput(out, output) {
+  await out.handle.close();
+  out.handle = null;
+  if (out.temporary) await fs.rename(out.temporary, output);
+  out.temporary = null;
+}
+
+/** Close a handle without letting a close that already happened mask an error. */
+function closeQuietly(handle) {
+  return handle.close().catch(() => {});
+}
+
+/** Remove a file without letting a cleanup failure replace the real error. */
+function removeQuietly(target) {
+  if (!target) return Promise.resolve();
+  return fs.rm(target, { force: true }).catch(() => {});
+}
+
+/**
+ * Throw unless the path is a regular file to read.
+ *
+ * `fs.open` on a directory succeeds on Windows and reports a size of zero, so
+ * the chunk loop had nothing to read and `encrypt` finished "successfully" with
+ * a container holding an empty file while printing that the original was not
+ * touched. On Linux the read fails instead, with a raw EISDIR that says nothing
+ * about which argument was wrong.
+ */
+function requireRegularFile(stats, input) {
+  if (stats.isFile()) return;
+  if (stats.isDirectory()) throw new FormatError(`${input} is a directory, not a file`);
+  throw new FormatError(`${input} is not a regular file`);
 }
 
 /**
@@ -72,6 +148,7 @@ export function deriveKey(password, salt, { log2N = DEFAULT_LOG2_N, r = DEFAULT_
  * @param {(progress: {bytes: number, total: number}) => void} [options.onProgress]
  * @param {number} [options.chunkSize]
  * @param {boolean} [options.force] allow replacing an existing output file
+ * @param {AbortSignal} [options.signal] stop between chunks and clean up
  */
 export async function encryptFile({
   input,
@@ -83,22 +160,26 @@ export async function encryptFile({
   chunkSize = CHUNK_SIZE,
   force = false,
   onProgress = null,
+  signal = null,
 }) {
   const handle = await fs.open(input, 'r');
   let out = null;
   try {
-    const { size } = await handle.stat();
+    const before = await handle.stat({ bigint: true });
+    requireRegularFile(before, input);
+    const size = Number(before.size);
     const salt = crypto.randomBytes(SALT_SIZE);
     const header = buildHeader({ salt, plaintextLength: size, log2N, r, p, chunkSize });
     const key = await deriveKey(password, salt, { log2N, r, p });
 
-    out = await fs.open(output, force ? 'w' : 'wx');
-    await out.write(header);
+    out = await openOutput(output, force);
+    await out.handle.write(header);
 
     const chunkCount = Math.max(1, Math.ceil(size / chunkSize));
     let position = 0;
 
     for (let index = 0; index < chunkCount; index += 1) {
+      signal?.throwIfAborted();
       const wanted = Math.min(chunkSize, size - position);
       const plaintext = Buffer.allocUnsafe(Math.max(0, wanted));
       let filled = 0;
@@ -114,16 +195,40 @@ export async function encryptFile({
       cipher.setAAD(chunkAad(header, index, isFinal));
       const ciphertext = Buffer.concat([cipher.update(block), cipher.final()]);
       const tag = cipher.getAuthTag();
-      await out.write(ciphertext);
-      await out.write(tag);
+      await out.handle.write(ciphertext);
+      await out.handle.write(tag);
 
       position += filled;
       onProgress?.({ bytes: position, total: size });
     }
+
+    // The output existed while this file was being read, so the one thing that
+    // must not have happened is a write to the input: on Windows `NOTES.TXT` and
+    // `notes.txt` are one file, and the CLI's check compares names that only it
+    // can spell. A file that changed under the reader is a container that
+    // describes something that is no longer there, so it is discarded.
+    const after = await handle.stat({ bigint: true });
+    if (
+      after.dev !== before.dev ||
+      after.ino !== before.ino ||
+      after.size !== before.size ||
+      after.mtimeNs !== before.mtimeNs
+    ) {
+      throw new FormatError(`${input} was modified while it was being encrypted; the output was discarded`);
+    }
+
+    await publishOutput(out, output);
+    out = null; // publishOutput closed the handle and moved the temporary file
     return { bytes: size, chunks: chunkCount, header };
   } finally {
     await handle.close();
-    if (out) await out.close();
+    if (out) {
+      if (out.handle) await closeQuietly(out.handle);
+      // With --force the destination was never opened, so only the temporary
+      // file goes; otherwise the exclusive create guarantees that what is at
+      // `output` is this run's own half-written container.
+      await removeQuietly(out.temporary ?? output);
+    }
   }
 }
 
@@ -141,12 +246,23 @@ export async function encryptFile({
  * @param {(progress: {bytes: number, total: number}) => void} [options.onProgress]
  * @param {number} [options.chunkSize] override for testing; must be a power of two
  * @param {boolean} [options.force] allow replacing an existing output file
+ * @param {AbortSignal} [options.signal] stop between chunks and clean up
  */
-export async function decryptFile({ input, output, password, chunkSize = null, force = false, onProgress = null }) {
+export async function decryptFile({
+  input,
+  output,
+  password,
+  chunkSize = null,
+  force = false,
+  onProgress = null,
+  signal = null,
+}) {
   const handle = await fs.open(input, 'r');
   let out = null;
   try {
-    const { size: containerBytes } = await handle.stat();
+    const stats = await handle.stat();
+    requireRegularFile(stats, input);
+    const { size: containerBytes } = stats;
     const headerBuffer = Buffer.alloc(HEADER_SIZE);
     const { bytesRead } = await handle.read(headerBuffer, 0, HEADER_SIZE, 0);
     if (bytesRead < HEADER_SIZE) throw new FormatError('the file is too short to be a lockbox container');
@@ -165,11 +281,12 @@ export async function decryptFile({ input, output, password, chunkSize = null, f
     // different chunk size still opens. An override only exists for tests.
     const effectiveChunkSize = chunkSize ?? header.chunkSize;
 
-    out = await fs.open(output, force ? 'w' : 'wx');
+    out = await openOutput(output, force);
     let position = HEADER_SIZE;
     let written = 0;
 
     for (let index = 0; index < header.chunkCount; index += 1) {
+      signal?.throwIfAborted();
       const isFinal = index === header.chunkCount - 1;
       // Every non-final chunk holds a full chunk of plaintext; the last one
       // holds whatever is left.
@@ -193,7 +310,7 @@ export async function decryptFile({ input, output, password, chunkSize = null, f
       } catch {
         throw new DecryptError('wrong password, or the file has been modified');
       }
-      await out.write(plaintext);
+      await out.handle.write(plaintext);
       written += plaintext.length;
       onProgress?.({ bytes: written, total: header.plaintextLength });
     }
@@ -201,18 +318,19 @@ export async function decryptFile({ input, output, password, chunkSize = null, f
     if (written !== header.plaintextLength) {
       throw new DecryptError('the decrypted length does not match the header');
     }
+    await publishOutput(out, output);
+    out = null; // publishOutput closed the handle and moved the temporary file
     return { bytes: written, header };
-  } catch (error) {
-    // A failed decryption must not leave a partial file behind.
-    if (out) {
-      await out.close();
-      out = null;
-    }
-    await fs.rm(output, { force: true });
-    throw error;
   } finally {
+    // A failed decryption must not leave a partial file behind, and it must not
+    // touch one it did not create: removing the *output path* unconditionally is
+    // how `decrypt bad.locked -o precious.txt --force` deleted precious.txt
+    // without ever having opened it. `openOutput` decides which file that is.
     await handle.close();
-    if (out) await out.close();
+    if (out) {
+      if (out.handle) await closeQuietly(out.handle);
+      await removeQuietly(out.temporary ?? output);
+    }
   }
 }
 
@@ -235,7 +353,9 @@ async function readFully(handle, buffer, position) {
 export async function inspectFile(input) {
   const handle = await fs.open(input, 'r');
   try {
-    const { size } = await handle.stat();
+    const stats = await handle.stat();
+    requireRegularFile(stats, input);
+    const { size } = stats;
     const headerBuffer = Buffer.alloc(HEADER_SIZE);
     const { bytesRead } = await handle.read(headerBuffer, 0, HEADER_SIZE, 0);
     if (bytesRead < HEADER_SIZE) throw new FormatError('the file is too short to be a lockbox container');
@@ -247,8 +367,9 @@ export async function inspectFile(input) {
       expectedBytes: expected,
       truncated: size < expected,
       extraData: size > expected,
-      kdfMemoryBytes: 128 * 2 ** header.log2N * header.r,
-    };  } finally {
+      kdfMemoryBytes: kdfMemoryBytes(header.log2N, header.r),
+    };
+  } finally {
     await handle.close();
   }
 }

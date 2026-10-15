@@ -1,6 +1,6 @@
 {
   "name": "lockbox-cli",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Encrypt a file with a password. scrypt for the key, AES-256-GCM for the data, both from Node's own crypto module.",
   "license": "MIT",
   "type": "module",
@@ -23,8 +23,7 @@
   },
   "scripts": {
     "start": "node bin/lockbox.js",
-    "test": "node --test \"test/*.test.js\"",
-    "test:files": "node scripts/test-files.js"
+    "test": "node --test test/cli-kit.test.js test/cli.test.js test/crypto.test.js test/password.test.js"
   },
   "os": [
     "win32",

@@ -69,17 +69,22 @@ modified, so a mistake costs you nothing.
 | Option | Meaning |
 | --- | --- |
 | `-o, --out <file>` | Write somewhere other than `<file>.locked` |
-| `-f, --force` | Allow overwriting an existing output file |
+| `-f, --force` | Allow overwriting an existing output file. The new file is written beside it and moved into place only once it is complete, so a run that fails leaves the old file exactly as it was |
 | `--cost <n>` | scrypt log2(N), 12 to 22. Default 16, about 64 MB per attempt |
 | `--password-env <VAR>` | Read the password from an environment variable |
 | `--password-file <file>` | Read the first line of a file as the password |
 | `--no-progress` | Do not print a progress line |
 
+A directory is not a file: `encrypt`, `decrypt` and `inspect` all refuse one
+rather than reading nothing from it and reporting success.
+
 ### `lockbox decrypt <file.locked>`
 
 Writes the original bytes back. With no `--out`, `<file.locked>` becomes
 `<file>`. **A failed decryption deletes its partial output**, so a wrong password
-never leaves a file that looks like it worked.
+never leaves a file that looks like it worked. Only a file this run created is
+ever removed: a failure that happens before anything is written leaves whatever
+is already at the output path untouched.
 
 ### `lockbox inspect <file.locked>`
 
@@ -104,8 +109,8 @@ notes.txt.locked
 | Code | Meaning |
 | --- | --- |
 | 0 | the command did what it was asked |
-| 1 | the operation failed: a wrong password, a damaged container, an unreadable file |
-| 2 | the request was impossible: a bad option, a missing file, refusing to overwrite without `--force`, output and input being the same file |
+| 1 | the operation failed: a wrong password, an unreadable file, a disk that said no |
+| 2 | the request was impossible: a bad option, a missing file, a directory where a file was expected, a container that fails its format check, refusing to overwrite without `--force`, output and input being the same file |
 
 The split matters in a script. `2` means nothing was attempted and passing
 `--force` (or fixing the command) may be all that is needed; `1` means the tool
@@ -129,6 +134,14 @@ key = scrypt(password, salt, N=2^16, r=8, p=1)
 still be opened if the defaults change later. The salt is 16 random bytes per
 file, so the same password on the same content produces a different key every
 time and the same file encrypted twice shares nothing.
+
+The header is read before the password is asked for, so `r` and `p` are also the
+two bytes an attacker who hands you a file controls. Key derivation happens
+before any tag is checked, which would make an unbounded header a way to spend
+your memory and your time rather than their own. They are therefore bounded on
+both sides: at most `r=32`, `p=16`, and no more memory than the most expensive
+container this build writes (`log2(N)=22` with `r=8`) needs. A container that
+asks for more is refused as a format error, before a key is derived.
 
 ### The data
 
@@ -185,10 +198,13 @@ one extra line.
 npm test
 ```
 
-29 tests. The ones that matter most are the negative ones: a wrong password, a
-single flipped byte, an edited header, a truncated file, a removed chunk, two
-swapped chunks. Each of those must fail loudly, and each has a test asserting it
-does.
+The tests that matter most are the negative ones: a wrong password, a single
+flipped byte, an edited header, a truncated file, a removed chunk, two swapped
+chunks, a directory where a file was expected, an interruption halfway through.
+Each of those must fail loudly, and each has a test asserting it does — along
+with the ones asserting that nothing is destroyed on the way: an existing file
+survives a failed run, and a second name for the input file is recognised as the
+same file.
 
 ## What the API looks like
 
